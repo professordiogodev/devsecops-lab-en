@@ -1,0 +1,80 @@
+# Demo Shop DevSecOps pipeline
+# The same checks as ./scan.sh, now as quality gates on every pull request.
+name: devsecops
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: the GITHUB_TOKEN can only read the code.
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      # GOOD PRACTICE: pin third-party actions to the full commit SHA, not the tag
+      # (see the tj-actions/changed-files incident, March 2025). E.g. actions/checkout@<sha> # v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: secrets also live in old commits
+      - name: gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            git /repo --no-banner --verbose --redact
+
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: semgrep
+        run: |
+          docker run --rm -v "$PWD:/src" semgrep/semgrep \
+            semgrep scan --config p/python --config p/secrets --metrics=off --error app
+
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: trivy (dependencies)
+        run: |
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest \
+            fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 /src/app
+
+  iac:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: trivy (IaC)
+        run: |
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest \
+            config --severity HIGH,CRITICAL --exit-code 1 /src/infra
+      - name: conftest (organisation policies)
+        run: |
+          docker run --rm -v "$PWD:/project" openpolicyagent/conftest \
+            test infra/main.tf -p policy --namespace terraform
+          docker run --rm -v "$PWD:/project" openpolicyagent/conftest \
+            test app/Dockerfile -p policy --namespace docker
+
+  # BONUS - deploy without static secrets (OIDC).
+  # GitHub issues a short-lived identity token; AWS exchanges it for temporary credentials
+  # of a role whose trust policy only accepts THIS repository and THIS branch.
+  # There is no AWS_ACCESS_KEY_ID stored anywhere.
+  #
+  # deploy:
+  #   needs: [secrets, sast, sca, iac]
+  #   if: github.ref == 'refs/heads/main'
+  #   runs-on: ubuntu-latest
+  #   environment: production        # manual approval + protection rules
+  #   permissions:
+  #     id-token: write              # allows requesting the OIDC token
+  #     contents: read
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: arn:aws:iam::123456789012:role/shop-deploy
+  #         aws-region: eu-west-1
+  #     - run: terraform -chdir=infra init && terraform -chdir=infra apply -auto-approve
